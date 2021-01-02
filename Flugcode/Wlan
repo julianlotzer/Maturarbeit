@@ -1,0 +1,104 @@
+#include <Arduino.h>
+#include<ESP8266WiFi.h>
+unsigned long previousMillisUS = 0;
+unsigned long currentMillisUS = millis();
+//const int pwPin1 = 5;
+//long pulse1, sensor1;
+unsigned long previousMillis = 0;
+const long interval = 1000;
+const char* ssid = "EDF Rocket";
+const char* password = "edfrocket123"; // has to be longer than 7 chars
+int ledPin = 2; // GPIO13
+WiFiServer UAVserver(80);
+
+void setup() {
+
+  //pinMode(pwPin1, INPUT);
+   Serial.begin(9600);
+   delay(10);
+   pinMode(ledPin, OUTPUT);
+   digitalWrite(ledPin, HIGH); // turn on
+   WiFi.mode(WIFI_AP);
+   WiFi.softAP(ssid, password, 1);
+/*
+  Serial.print("Access Point \"");
+  Serial.print(ssid);
+  Serial.println("\" started");
+  Serial.print("IP address:\t");
+  Serial.println(WiFi.softAPIP());         // Send the IP address of the ESP8266 to the computer
+ */ 
+   UAVserver.begin();
+   
+}
+
+void loop() {
+
+
+  unsigned char number_client;
+  number_client= wifi_softap_get_station_num();
+  WiFiClient client = UAVserver.available();
+  String command = "";
+  unsigned long currentMillis = millis();
+
+  if (client){
+    while(client.connected() && number_client > 0){
+      number_client= wifi_softap_get_station_num();
+      currentMillis = millis();
+
+    if (currentMillis - previousMillis >= interval) {
+    // SEND C111 Every Second
+      previousMillis = currentMillis;
+      char ConnActive[5] = "C111";
+      Serial.write(ConnActive, 5);
+      //client.print("1125");
+
+    }
+      while (client.available()>0){
+        
+        char c = client.read();
+        if(c == '\n'){
+                
+          int comm_len = command.length() + 1;
+          if(comm_len == 5){
+            char value[comm_len];
+            command.toCharArray(value, comm_len); //Erste n Buchstaben/Zahlen nehmen und in char value Speichern
+            Serial.write(value, comm_len); //value über Serial schicken
+            digitalWrite(ledPin, LOW); // turn on
+          }
+          break;
+        }
+      command += c;
+
+    }
+
+    command = "";
+
+
+    delay(10);
+    }
+
+    client.stop();
+
+
+}
+else if(number_client > 0) { 
+      currentMillis = millis();
+  if (currentMillis - previousMillis >= interval) {
+    previousMillis = currentMillis;
+    char ConnActive[5] = "C110";
+    Serial.write(ConnActive, 5);
+    }
+}
+
+else if(number_client == 0) { 
+  
+  currentMillis = millis();
+
+  if (currentMillis - previousMillis >= interval) {
+  previousMillis = currentMillis;
+  char ConnActive[5] = "C000";
+  Serial.write(ConnActive, 5);
+  }
+}
+
+}
