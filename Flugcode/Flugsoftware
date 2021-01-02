@@ -1,0 +1,1646 @@
+#include <Arduino.h>
+#include <Servo.h>
+#include <SD.h>
+#include <SPI.h>
+#include <Wire.h>
+#include <Adafruit_Sensor.h>
+#include "Adafruit_BMP3XX.h"
+#include <Adafruit_BNO055.h>
+#include <math.h>
+#include <utility/imumaths.h>
+#include <quaternion.h>
+#include <TFmini_plus.h>
+#include <BasicLinearAlgebra.h>
+#include <TFMPlus.h> // Include TFMini Plus Library v1.4.1
+TFMPlus tfmP;        // Create a TFMini Plus object
+#define HWSERIALLidar Serial4
+#define HWSERIALWEMOS Serial5
+#define SEALEVELPRESSURE_HPA (1013.25)
+
+//DEBUG variabeln für Fehler nub
+float uHILFE = 0;
+float uHILFE2 = 0;
+float uHILFE3 = 0;
+float intval = 0;
+//Matrix  für LQR Controller
+BLA::Matrix<3, 7> K = {1.6872, 2.8479, 0, 0, 0, 0, 0.544,
+                       0, 0, -13.1072, 0, -4.4384, 0, 0,
+                       0, 0, 0, -13.1072, 0, -4.4384, 0};
+
+BLA::Matrix<7, 1> x = {0, 0, 0, 0, 0, 0, 0};
+BLA::Matrix<7, 1> xs = {0.75, 0, 0, 0, 0, 0, 0};
+BLA::Matrix<3, 1> u = {0, 0, 0};
+BLA::Matrix<3, 1> us = {19.9143, 0.97, -0.58}; //xs *-11.5375 big: 20.30kg
+float zgain = 0.4;
+//Settings
+int samplerate = 1000;     //MCU Cycle in HZ 
+int brightness = 200;      //Helligkeit der LEDs (256 Dunkel,0 Hell)
+const long interval = 500; //Blink Intervall der LEDs
+
+//WEIGHT FOR LOW PASS FILTER (Müll)
+float lowpassUS = 0.8;
+
+//Hardware Pins
+Adafruit_BMP3XX bmp; // I2C
+Adafruit_BNO055 bno = Adafruit_BNO055(55, 0x28);
+const int button1 = 9;   // button 1
+const int button2 = 14;  //button 2
+const int ledPinGRN = 2; //2= Grün
+const int ledPinBLU = 3; //3= Blau
+const int ledPinRED = 4; //3= Blau
+const int anPin1 = 0;
+const int edfVolt1 = 22;
+Servo servoZ; //Thrust vane servo
+Servo servoX; //ServoUnten
+Servo servoY; //ServoOben
+Servo ESC;    //ESC EDF
+const int chipSelect = 10;
+
+//SD Karte
+#define BASIS "LOG"
+const uint8_t BASIS_SIZE = sizeof(BASIS) - 1;
+char fileName[] = BASIS "00.txt";
+unsigned int sdn = 0;
+File dataFile;
+Sd2Card card;
+SdVolume volume;
+SdFile root;
+bool SDwriteState = false;
+bool SDreconnect = false;
+String randNumber;
+String filename;
+
+//------------------------------------------------------------------------------------------------------------------------------------
+//Variables
+//ESC
+int ESCdefaultoffset = 120;
+int ESCdefault = 580; //540 = 11.3volts 625 = 12.2 volts, 1 volt = 110, 11.95 = 580, 1 volt = 61
+int ESCvalue = 0;
+bool ESCon = false;
+bool ESCland = false;
+bool closeGround = false;
+bool ESCstartup = false;
+bool gostartup = true;
+int kLand = 0;
+//Servos
+int valX = 100;
+int valY = 100;
+int valZ = 90;
+int eqZ = 90;
+bool ServoOn = false;
+//Barometer
+float BMPtemp;
+float BMPheight;
+float pressure;
+float calheight = 0;
+bool BMPcalibrate = false;
+//IMU
+bool IMUcalibrate = false;
+bool ACCcalibrate = false;
+typedef struct
+{
+  float aX;  //acceleration X (m/s^2)
+  float aY;  //acceleration Y (m/s^2)
+  float aZ;  //acceleration Z (m/s^2)
+  float aH;  //acceleratopm X in World frame
+  float eX;  //euler X (rad)
+  float eY;  //euler Y (rad)
+  float eZ;  //euler Z (rad)
+  float gX;  //gyroscope X (deg/s, eigentlich rad/s nach handbuch aber anscheinend nicht lmao)
+  float gY;  //gyroscope Y (deg/s, eigentlich rad/s nach handbuch aber anscheinend nicht lmao)
+  float gZ;  //gyroscope Z (deg/s, eigentlich rad/s nach handbuch aber anscheinend nicht lmao)
+  float kgX; //gyroscope X (rad/s)
+  float kgY; //gyroscope X (rad/s)
+  float kgZ; //gyroscope X (rad/s)
+} IMUData;
+IMUData IMUData1 = {0, 0, 0, 0, 0, 0};
+
+float calX = 0, calY = 0.02, calZ = 1.63; //y = x
+float calaccX, calaccY, calaccZ = 0;
+
+//Buttons and LED stuff
+float batteryvolt = 0;
+float batteryref = 10;
+float edfbattVal1 = 0;
+int buttonState1 = 0; // button status
+int buttonState2 = 0;
+bool LEDchange = false;
+typedef struct
+{
+  int RED;
+  int GRN;
+  int BLU;
+  bool BLINK;
+} LEDstate;
+LEDstate LEDstate1 = {256, 256, 256, false};
+int ledBlinkOn = false;
+
+//Ultrasonic
+bool onground = false;
+float offsetLidar = 32;
+TFminiPlus lidar;
+const long LIDAR_UART_BAUDRATE = 115200;
+
+// float bufferedDistWemos = 0;
+float bufferedDist = 0;
+float bufferedDistprev = 0;
+float bufferedDistprevprev = 0;
+float unfilteredDist = 0;
+
+int kUS = 0;
+bool notrust = false;
+
+int inPin = 20;   // pushbutton connected to digital pin 7
+int valSharp = 0; // variable to store the read value
+
+//Timer
+unsigned long logMillis = 0;
+unsigned long IMUMillis = 0;
+unsigned long BMPMillis = 0;
+unsigned long USMillis = 0;
+unsigned long StartupMillis = 0;
+//unsigned long StartupRiseMillis = 0;
+unsigned long SDMillis = 0;
+unsigned long previousMillis = 0;
+unsigned long cycleMillis = millis();
+unsigned long currentMillis = millis();
+unsigned long currentMillisIntegrator = millis();
+int cycle = 1;
+//Connections
+bool Connected = false;
+bool AppActive = false;
+String DataWemos = "";
+String ReceivedCommand = "";
+
+//Kalman Filter Gyro X
+float uncertaintyEstX = 0.50;
+float kGainX = 0;
+float currentEstX = 0;
+float lastEstX = 0;
+float uncertaintyMeaX = 0.50;
+float processvarianceX = 0.01;
+//Kalman Filter Gyro Y
+float uncertaintyEstY = 0.50;
+float kGainY = 0;
+float currentEstY = 0;
+float lastEstY = 0;
+float uncertaintyMeaY = 0.50;
+float processvarianceY = 0.1;
+//Kalman Filter 3
+float uncertaintyEstZ = 0.50;
+float kGainZ = 0;
+float currentEstZ = 0;
+float lastEstZ = 0;
+float uncertaintyMeaZ = 0.50;
+float processvarianceZ = 0.1;
+
+//Kalman Filter ULTRASONIC
+float uncertaintyEstUS = 10;
+float kGainUS = 0;
+float currentEstUS = 0;
+float lastEstUS = 0;
+float uncertaintyMeaUS = 10;
+float processvarianceUS = 0.1;
+
+//Matrix  für KALMAN FILTER HEIGHT
+
+//A matrix = Systemmatrix
+BLA::Matrix<3, 3> H_A = {1, 0.01, 0,
+                         0, 1, 0,
+                         0, 0, 1};
+
+//STATE VECTOR X   = Zustandsvektor des Zustandbeobachters (ungenau)
+BLA::Matrix<3, 1> H_xk = {0,   //Ultrasonic height
+                          0,   //Vertical Speed
+                          20}; //Barometer Offset
+
+// B MATRIX = EINGANGSMATRIX
+BLA::Matrix<3, 1> H_B = {0.00005, //(delta t^2)/2 = Integration
+                         0.01,    //delta t
+                         0};
+
+//U Matrix = Eingangsvektor des Zustandbeobachters
+BLA::Matrix<1, 1> H_uk = {0}; //acceleration
+
+//Kalman Gain = Matrix der Kalman-Verstärkung
+BLA::Matrix<3, 2> H_Kgain = {0, 0,
+                             0, 0,
+                             0, 0};
+
+//uncertainty Estimate = Kovarianzmatrix des Schätzfehlers
+BLA::Matrix<3, 3> H_Pk = {1, 0, 0,
+                          0, 1, 0,
+                          0, 0, 50};
+
+//Uncertainty in the Measurement  = Kovarianzmatrix des Messrauschens
+BLA::Matrix<2, 2> H_R = {1, 0,
+                         0, 0.001};
+
+//Kovarianzmatrix des Systemrauschens
+BLA::Matrix<3, 3> H_Q = {0.01, 0, 0,
+                         0, 1, 0,
+                         0, 0, 0};
+
+//MAPS STATE TO MEASUREMENT VECTOR zK = Ausgangsmatrix C=H
+BLA::Matrix<2, 3> H_C = {1, 0, 1,
+                         1, 0, 0};
+//MEASUREMENT Z
+BLA::Matrix<2, 1> H_zk = {0,
+                          0};
+
+//IDENTITÄTSMATRIX
+BLA::Matrix<3, 3> H_I = {1, 0, 0,
+                         0, 1, 0,
+                         0, 0, 1};
+
+//Matrix  für 2. KALMAN FILTER HEIGHTA_____________________________________________________________________________
+
+//A matrix = Systemmatrix
+BLA::Matrix<2, 2> Ha_A = {1, 0.01,
+                          0, 1};
+
+//STATE VECTOR X   = Zustandsvektor des Zustandbeobachters (ungenau)
+BLA::Matrix<2, 1> Ha_xk = {0,  //Ultrasonic height
+                           0}; //Velocity
+
+// B MATRIX = EINGANGSMATRIX
+BLA::Matrix<2, 1> Ha_B = {0.00005, //(delta t^2)/2 = Integration
+                          0.01};   //ahsndijk
+
+//U Matrix = Eingangsvektor des Zustandbeobachters
+BLA::Matrix<1, 1> Ha_uk = {0}; //acceleration
+
+//Kalman Gain = Matrix der Kalman-Verstärkung
+BLA::Matrix<2, 1> Ha_Kgain = {0,
+                              0};
+
+BLA::Matrix<2, 1> Ha_G = {0.00005,
+                          0.01};
+
+//uncertainty Estimate = Kovarianzmatrix des Schätzfehlers
+BLA::Matrix<2, 2> Ha_Pk = {1, 0,
+                           0, 1};
+
+//Uncertainty in the Measurement  = Kovarianzmatrix des Messrauschens
+BLA::Matrix<1, 1> Ha_R = {0.0001};
+
+//Kovarianzmatrix des Systemrauschens
+BLA::Matrix<1, 1> Ha_Q = {40}; //acc
+
+//MAPS STATE TO MEASUREMENT VECTOR zK = Ausgangsmatrix C=H
+BLA::Matrix<1, 2> Ha_C = {1, 0};
+//MEASUREMENT Z
+BLA::Matrix<1, 1> Ha_yk = {0};
+
+//IDENTITÄTSMATRIX
+BLA::Matrix<2, 2> Ha_I = {1, 0,
+                          0, 1};
+
+void setup()
+{
+  // Start up UART communications with the lidar
+  Serial4.begin(LIDAR_UART_BAUDRATE);
+  lidar.begin(&Serial4);
+
+  // Set lidar options (saving is important)
+  lidar.set_framerate(TFMINI_PLUS_FRAMERATE_250HZ);
+  lidar.set_output_format(TFMINI_PLUS_OUTPUT_CM);
+  lidar.enable_output(true);
+  lidar.save_settings();
+
+  //SD KARTE VERBINDEN
+  Serial.print("Initializing SD card...");
+  pinMode(10, OUTPUT);
+
+  if (!SD.begin(chipSelect))
+  {
+    Serial.println("Card failed, or not present");
+    return;
+  }
+  Serial.println("card initialized.");
+  while (SD.exists(fileName))
+  {
+    if (fileName[BASIS_SIZE + 1] != '9')
+    {
+      fileName[BASIS_SIZE + 1]++;
+    }
+    else if (fileName[BASIS_SIZE] != '9')
+    {
+      fileName[BASIS_SIZE + 1] = '0';
+      fileName[BASIS_SIZE]++;
+    }
+    else
+    {
+      Serial.println(F("Can't create file name"));
+      return;
+    }
+  }
+
+  dataFile = SD.open(fileName, FILE_WRITE);
+
+  if (!dataFile)
+  {
+    Serial.println("error opening datalog.txt");
+    // Wait forever since we cant write data
+    while (1)
+      ;
+  }
+
+  //Hardware Init
+  analogReadRes(12);
+  pinMode(button1, INPUT);
+  pinMode(button2, INPUT);
+  pinMode(ledPinGRN, OUTPUT);
+  pinMode(ledPinBLU, OUTPUT);
+  pinMode(ledPinRED, OUTPUT);
+  ESC.attach(8, 1000, 2000);
+  servoX.attach(6, 1000, 2000); //Y = Pin 7
+  servoY.attach(7, 1000, 2000); //X = Pin 6
+  servoZ.attach(1, 1000,2000); //Z = Pin1
+  Serial.begin(115200);
+  //HWSERIALUS.begin(9600);
+  HWSERIALWEMOS.begin(9600);
+
+  ESC.write(ESCvalue);                //0
+  servoX.write(valX);                 //Position 0
+  servoY.write(valY);                 //Position 0
+  servoZ.write(valZ);                 //Position 0
+  analogWrite(ledPinGRN, brightness); // LED an
+  analogWrite(ledPinBLU, brightness); // LED an
+  analogWrite(ledPinRED, brightness); // LED an
+
+  // Initialise the I
+
+  if (!bno.begin())
+  {
+    /* There was a problem detecting the BNO055 ... check your connections */
+    Serial.print("Ooops, no BNO055 detected ... Check your wiring or I2C ADDR!");
+    while (1)
+      ;
+  }
+
+  //BMP INITIALISATION
+  if (!bmp.begin())
+  {
+    Serial.println("Could not find a valid BMP3 sensor, check wiring!");
+    while (1)
+      ;
+  }
+
+  bmp.setTemperatureOversampling(BMP3_OVERSAMPLING_2X);
+  bmp.setPressureOversampling(BMP3_OVERSAMPLING_16X);
+  bmp.setIIRFilterCoeff(BMP3_IIR_FILTER_COEFF_31);
+  bmp.setOutputDataRate(BMP3_ODR_25_HZ);
+
+  delay(1000);
+  calheight = bmp.readAltitude(SEALEVELPRESSURE_HPA) - (0.3);
+  Serial.println(calheight);
+  Serial.println(calheight);
+  Serial.println(calheight);
+  delay(1000);
+  //BNO READ
+
+  int8_t temp = bno.getTemp();
+  bno.setExtCrystalUse(true);
+
+  Serial.print("Current Temperature: ");
+  Serial.print(temp);
+  Serial.println(" C");
+  Serial.println("");
+
+  //Set Calibration for Barometer
+  calheight = bmp.readAltitude(SEALEVELPRESSURE_HPA);
+  //LED
+  analogWrite(ledPinGRN, 256); // LED aus
+  analogWrite(ledPinBLU, 256); // LED aus
+  analogWrite(ledPinRED, 256); //LED aus
+}
+
+void SDstore()
+{
+
+  String SDstring = "";
+  logMillis = millis();
+  SDstring += String(edfbattVal1 * 0.01455172413);
+  SDstring += ",";
+  SDstring += String(logMillis);
+  SDstring += ",";
+  SDstring += String(IMUData1.eX, 5);
+  SDstring += ",";
+  SDstring += String(IMUData1.eY, 5);
+  SDstring += ",";
+  SDstring += String(IMUData1.eZ, 5);
+  SDstring += ",";
+  SDstring += String(IMUData1.gX, 5);
+  SDstring += ",";
+  SDstring += String(IMUData1.kgX, 5);
+  SDstring += ",";
+  SDstring += String(IMUData1.kgY, 5);
+  SDstring += ",";
+  SDstring += String(IMUData1.kgZ, 5);
+  SDstring += ",";
+  SDstring += String(IMUData1.gY, 5);
+  SDstring += ",";
+  SDstring += String(IMUData1.gZ, 5);
+  SDstring += ",";
+  SDstring += String(IMUData1.aX, 5);
+  SDstring += ",";
+  SDstring += String(IMUData1.aY, 5);
+  SDstring += ",";
+  SDstring += String(IMUData1.aZ, 5);
+  SDstring += ",";
+  SDstring += String(bufferedDist, 5); //US
+  SDstring += ",";
+  SDstring += String(H_zk(0), 5); //BMP
+  SDstring += ",";
+  SDstring += String(H_xk(0), 5); //KALMAN HEIGHT
+  SDstring += ",";
+  SDstring += String(H_xk(1), 5); //Kalman Velocity
+  SDstring += ",";
+  SDstring += String(H_xk(2), 5); //Kalman Barometer Offset
+  SDstring += ",";
+  SDstring += String(Ha_xk(0), 5); //Kalman HEIGHT 2
+  SDstring += ",";
+  SDstring += String(Ha_xk(1), 5); //Kalman VELOCITY 2
+  SDstring += ",";
+  SDstring += String(-(valX - 100));
+  SDstring += ",";
+  SDstring += String(-(valY - 100));
+  SDstring += ",";
+  SDstring += String(ESCvalue);
+  SDstring += ",";
+  SDstring += String(valZ-eqZ);
+  SDstring += ",";
+  SDstring += String(intval, 5);
+/*
+dataFile.print(edfbattVal1 * 0.01455172413);
+dataFile.print(",");
+dataFile.print(millis());
+dataFile.print(",");
+dataFile.print(IMUData1.eX, 5);
+dataFile.print(",");
+dataFile.print(IMUData1.eY, 5);
+dataFile.print(",");
+dataFile.print(IMUData1.eZ, 5);
+dataFile.print(",");
+dataFile.print(IMUData1.gX, 5);
+dataFile.print(",");
+dataFile.print(IMUData1.kgX, 5);
+dataFile.print(",");
+dataFile.print(IMUData1.kgY, 5);
+dataFile.print(",");
+dataFile.print(IMUData1.kgZ, 5);
+dataFile.print(",");
+dataFile.print(IMUData1.gY, 5);
+dataFile.print(",");
+dataFile.print(IMUData1.gZ, 5);
+dataFile.print(",");
+dataFile.print(IMUData1.aX, 5);
+dataFile.print(",");
+dataFile.print(IMUData1.aY, 5);
+dataFile.print(",");
+dataFile.print(IMUData1.aZ, 5);
+dataFile.print(",");
+dataFile.print(bufferedDist, 5); //US
+dataFile.print(",");
+dataFile.print(H_zk(0), 5);
+dataFile.print(",");
+dataFile.print(H_xk(0), 5);
+dataFile.print(",");
+dataFile.print(H_xk(1), 5);
+dataFile.print(",");
+dataFile.print(H_xk(2), 5);
+dataFile.print(",");
+dataFile.print(Ha_xk(0), 5);
+dataFile.print(",");
+dataFile.print(Ha_xk(1), 5);
+dataFile.print(",");
+dataFile.print(-(valX - 100));
+dataFile.print(",");
+dataFile.print(-(valY - 100));
+dataFile.print(",");
+dataFile.print(ESCvalue);
+dataFile.print(",");
+dataFile.print(valZ-eqZ);
+dataFile.print(",");
+dataFile.println(x(6));
+*/
+ dataFile.println(SDstring);
+  sdn++;
+  if (sdn == 99)
+  {
+    sdn = 0;
+    dataFile.flush();
+  }
+}
+
+void LEDfunction(LEDstate state)
+{
+  currentMillis = millis();
+  if (state.BLINK == true)
+  {
+    if (currentMillis - previousMillis >= interval)
+    {
+      // save the last time the LED BLINKED
+      previousMillis = currentMillis;
+
+      if (ledBlinkOn == false)
+      {
+        ledBlinkOn = true;
+        analogWrite(ledPinRED, state.RED); // LED an
+        analogWrite(ledPinGRN, state.GRN); // LED an
+        analogWrite(ledPinBLU, state.BLU); // LED an
+      }
+      else
+      {
+        ledBlinkOn = false;
+        analogWrite(ledPinRED, 256); // LED an
+        analogWrite(ledPinGRN, 256); // LED an
+        analogWrite(ledPinBLU, 256); // LED an
+      }
+    }
+  }
+
+  else
+  {
+    analogWrite(ledPinRED, state.RED); // LED an
+    analogWrite(ledPinGRN, state.GRN); // LED an
+    analogWrite(ledPinBLU, state.BLU); // LED an
+  }
+}
+
+void CommandRead()
+{
+  if (HWSERIALWEMOS.available() > 0)
+  {
+
+    DataWemos = HWSERIALWEMOS.readString(); //Read the serial data and store in DataWemos
+    HWSERIALWEMOS.flush();
+    if (DataWemos.charAt(0) != 'H')
+    {
+      //Serial.println(DataWemos); //Print data on Serial Monitor
+    }
+    //ESC
+    if (DataWemos.charAt(0) == 'E')
+    {
+
+      if (DataWemos.charAt(3) == '1')
+      {
+        LEDstate1 = {brightness, brightness, brightness, false}; //an
+        Serial.println("LED On");                                //Print data on Serial Monitor
+
+        //SET batteryvolt from EDF BATT VAL FOR OFFSET
+        if ((edfbattVal1 * 0.01455172413) > 9 && (edfbattVal1 * 0.01455172413) < 14)
+        {
+          batteryvolt = (edfbattVal1 * 0.01455172413);
+        }
+        else
+        {
+          batteryvolt = 12;
+        }
+
+        if (batteryvolt > 10.5 && batteryvolt < 12)
+        {
+          ESCdefault =  (520+ESCdefaultoffset) + (batteryvolt - 11.3)*50;
+        }
+
+        if (batteryvolt >= 12)
+        {
+          ESCdefault =  (640+ESCdefaultoffset) + (batteryvolt - 12.2)*110;
+        }
+
+        
+
+        /*
+        if (ESCon == false)
+        {
+          ESCstartup = true;
+          ESCvalue = 100;
+          ESCdefault = 730;
+          StartupMillis = millis();
+        }
+        */
+       if (gostartup==true){
+       ESCstartup = true;
+       gostartup = false;
+       }
+        StartupMillis = millis();
+        ESCon = true;
+        ESCland = false;
+      }
+
+      else if (DataWemos.charAt(3) == '0')
+      {
+        LEDstate1 = {256, 256, 256, false}; //aus
+        Serial.println("LED Off");          //Print data on Serial Monitor
+        ESCon = false;
+        ESCland = false;
+        ESCstartup = false;
+      }
+
+      else if (DataWemos.charAt(3) == '2')
+      {
+        LEDstate1 = {256, 256, 256, false}; //aus
+        Serial.println("LED Off");          //Print data on Serial Monitor
+        ESCland = true;
+        ESCstartup = false;
+      }
+    }
+
+    //Dist Measurement
+    /*   if(DataWemos.charAt(0) == 'H'){
+      DataWemos.remove(0,1);
+     bufferedDistWemos = DataWemos.toInt();
+    }
+*/
+
+    //Set Steady State Height
+    if (DataWemos.charAt(0) == 'V')
+    {
+
+      DataWemos.remove(0, 1);
+      xs(0) = (DataWemos.toInt() - 100) / 100;
+    }
+
+    //LEDS
+    if (DataWemos.charAt(0) == 'L')
+    {
+
+      if (DataWemos.charAt(3) == '1')
+      {
+        LEDstate1 = {brightness, brightness, brightness, false}; //an
+        Serial.println("LED On");                                //Print data on Serial Monitor
+        LEDchange = true;
+      }
+
+      else if (DataWemos.charAt(3) == '0')
+      {
+        LEDstate1 = {256, 256, 256, false}; //aus
+        Serial.println("LED Off");          //Print data on Serial Monitor
+        LEDchange = true;
+      }
+    }
+
+    //SERVOS
+    if (DataWemos.charAt(0) == 'T')
+    {
+
+      if (DataWemos.charAt(3) == '1')
+      {
+
+        ServoOn = true;
+      }
+
+      else if (DataWemos.charAt(3) == '0')
+      {
+
+        ServoOn = false;
+      }
+    }
+
+    //CALIBRATE SENSORS
+    if (DataWemos.charAt(0) == 'R')
+    {
+
+      if (DataWemos.charAt(3) == '1')
+      {
+        IMUcalibrate = true;
+        BMPcalibrate = true;
+      }
+
+      else if (DataWemos.charAt(3) == '2')
+      {
+        ACCcalibrate = true;
+      }
+    }
+
+    //SD DATA LOGGING
+    if (DataWemos.charAt(0) == 'S')
+    {
+
+      if (DataWemos.charAt(3) == '1')
+      {
+        SDwriteState = true;
+      }
+
+      else if (DataWemos.charAt(3) == '0')
+      {
+        dataFile.flush();
+        dataFile.close();
+        SDwriteState = false;
+      }
+    }
+
+    //APP/PHONE STATUS
+    if (DataWemos.charAt(0) == 'C')
+    {
+
+      if (DataWemos.charAt(3) == '0')
+      {
+
+        if (DataWemos.charAt(2) == '1')
+        {
+          Connected = true;
+          AppActive = false;
+          LEDchange = false;
+          LEDstate1 = {brightness, 256, 256, true};
+          //Serial.print("App Closed"); //Print data on Serial Monitor
+          //Serial.print("\t");
+        }
+
+        else if (DataWemos.charAt(2) == '0')
+        {
+          LEDchange = false;
+          Connected = false;
+          AppActive = false;
+          LEDstate1 = {brightness, 256, 256, false};
+          //Serial.print("Connection Lost"); //Print data on Serial Monitor
+          //Serial.print("\t");
+        }
+      }
+
+      else if (DataWemos.charAt(3) == '1')
+      {
+        Connected = true;
+        AppActive = true;
+        //Serial.print("App Active"); //Print data on Serial Monitor
+        //Serial.print("\t");
+        if (LEDchange == false)
+        {
+          LEDstate1 = {256, brightness, 256, false};
+        }
+      }
+    }
+  }
+  DataWemos = "";
+}
+
+void Ultrasonic()
+{
+  valSharp = digitalRead(inPin); // read the input pin
+  bufferedDistprevprev = bufferedDistprev;
+  // Grab a reading from the lidar
+  tfminiplus_data_t data;
+
+  bool result = lidar.read_data(data, true);
+
+  if (abs(bufferedDist - (data.distance - offsetLidar)) > 150)
+  {
+    bufferedDist = bufferedDist;
+  }
+
+  else
+  {
+    // Display reading
+    bufferedDist = data.distance - offsetLidar;
+  }
+
+  if (bufferedDist < 0)
+  {
+
+    bufferedDist = 0;
+  }
+
+  if (valSharp == 1)
+  {
+
+    onground = false;
+  }
+
+  else
+  {
+
+    onground = true;
+  }
+bufferedDistprev = bufferedDist;
+bufferedDist = (bufferedDistprevprev + bufferedDistprev)/2;
+  /*
+  HWSERIALUS.flush();
+  HWSERIALUS.write(0x55); 
+  if(HWSERIALUS.available() >= 2){
+    MSByteDist = HWSERIALUS.read(); 
+    LSByteDist  = HWSERIALUS.read();
+    mmDist  = MSByteDist * 256 + LSByteDist; 
+  if((mmDist > 1) && (mmDist < 4000)) {
+  bufferedDist = mmDist;
+  }
+  //  if((mmDist > 1) && (mmDist < 4000)) {
+ //     Serial.print("Distance: ");
+   //   Serial.print(mmDist, DEC);
+   //   Serial.println(" mm");
+ //   }
+  }
+*/
+}
+
+void DataOutput()
+{
+
+  currentMillis = millis();
+  if (currentMillis - cycleMillis >= 50)
+  {
+
+    cycleMillis = currentMillis;
+    /*
+    Serial.print(H_zk(1), 5); //US
+    Serial.print(',');
+    Serial.print(H_xk(0)); //KH
+    Serial.print(',');
+    Serial.print(H_xk(1)); //KV
+    Serial.print(',');
+    Serial.print(H_xk(2)); //KB
+    Serial.print(',');
+    Serial.print(Ha_xk(0)); //KHa
+    Serial.print(',');
+    Serial.println(Ha_xk(1)); //KVa
+
+    
+    Serial.print(',');
+    Serial.print("Volt:");                 //EDF Volt
+    Serial.print(edfbattVal1 * 0.01455172413); //EDF Volt
+    Serial.print(',');
+    Serial.print("Integral:"); //EDF Volt
+    Serial.println(x(6)); //EDF Volt
+  */
+
+    Serial.print(cycle * 10);
+    Serial.print("HZ");
+    Serial.print("\t");
+    cycle = 1;
+
+    Serial.print("BMP: ");
+    Serial.print(BMPheight);
+    Serial.print("I: ");
+    Serial.print(x(6));
+    Serial.print(" m");
+    Serial.print("\t\t");
+
+    Serial.print("u1: ");
+    Serial.print(u(0), DEC);
+    Serial.print(" ");
+    Serial.print("u2: ");
+    Serial.print(u(1));
+    Serial.print(" ");
+    Serial.print("u3: ");
+    Serial.print(u(2));
+    Serial.print("PWM: ");
+    Serial.print(ESCvalue);
+        Serial.print("Vz: ");
+    Serial.print(valZ );
+    Serial.print("Vx: ");
+    Serial.print(-(valX - 100));
+    Serial.print("Vy: ");
+    //Serial.print(IMUData1.eX);
+    //Serial.print("\t\t");
+    Serial.print(-(valY - 100));
+    Serial.print("\t\t");
+
+    uint8_t system, gyro, accel, mag = 0;
+    bno.getCalibration(&system, &gyro, &accel, &mag);
+    Serial.print("CAL: ");
+    Serial.print(system, DEC);
+    Serial.print(" G=");
+    Serial.print(gyro, DEC);
+    Serial.print(" A=");
+    Serial.print(accel, DEC);
+    Serial.print(" M=");
+    Serial.print(mag, DEC);
+    Serial.print("\t\t");
+
+    Serial.print("aX: ");
+    Serial.print(IMUData1.aX);
+    Serial.print("aY: ");
+    Serial.print(IMUData1.aY);
+    Serial.print(" aZ: ");
+    Serial.print(IMUData1.aZ);
+    Serial.print(" aH: ");
+    Serial.print(IMUData1.aH);
+    Serial.print("\t\t");
+
+    Serial.print("US: ");
+    Serial.print(H_zk(1), 5);
+    Serial.print("kH: ");
+    Serial.print(H_xk(0));
+    Serial.print(" kV: ");
+    Serial.print(H_xk(1));
+    Serial.print(" kB: ");
+    Serial.print(H_xk(2));
+    Serial.print("\t\t");
+
+    Serial.print("eX: ");
+    Serial.print(IMUData1.eX);
+    Serial.print("eY: ");
+    Serial.print(IMUData1.eY);
+    Serial.print(" eZ: ");
+    Serial.print(IMUData1.eZ);
+    Serial.print("\t\t");
+
+    Serial.print("gX: ");
+    Serial.print(IMUData1.gX);
+    Serial.print("gY: ");
+    Serial.print(IMUData1.gY);
+    Serial.print(" gZ: ");
+    Serial.println(IMUData1.kgZ);
+  }
+
+  else
+  {
+    cycle++;
+  }
+}
+
+void IMU()
+{
+
+  imu::Vector<3> acc = bno.getVector(Adafruit_BNO055::VECTOR_LINEARACCEL);
+  imu::Quaternion quat = bno.getQuat();
+  imu::Vector<3> eul = quat.toEuler();
+  imu::Vector<3> gyr = bno.getVector(Adafruit_BNO055::VECTOR_GYROSCOPE);
+
+  if (IMUcalibrate == true || ACCcalibrate == true)
+  {
+    // set the Calibration value
+    calaccX = abs(acc.x());
+    calaccY = abs(acc.y());
+    calaccZ = abs(acc.z());
+    ACCcalibrate = false;
+  }
+
+  if (acc.x() > 0)
+  {
+    acc.x() = acc.x() - calaccX;
+  }
+
+  else if (acc.x() < 0)
+  {
+    acc.x() = acc.x() - calaccX;
+  }
+
+  if (acc.y() > 0)
+  {
+    acc.y() = acc.y() - calaccY;
+  }
+
+  else if (acc.y() < 0)
+  {
+    acc.y() = acc.y() - calaccY;
+  }
+
+  if (acc.z() > 0)
+  {
+    acc.z() = acc.z() - calaccZ;
+  }
+
+  else if (acc.z() < 0)
+  {
+    acc.z() = acc.z() - calaccZ;
+  }
+
+  IMUData1.aX = acc.z();
+  IMUData1.aY = acc.x();
+  IMUData1.aZ = acc.y();
+
+  //eul = eul*57296/1000;
+  //eul.z() = eul.z()-90;
+  if (IMUcalibrate == true)
+  {
+    // set the Calibration value
+    calX = abs(eul.x());
+    calY = abs(eul.y());
+    calZ = abs(eul.z());
+    IMUcalibrate = false;
+  }
+
+  if (eul.x() >= calX)
+  {
+    eul.x() = eul.x() - calX;
+  }
+
+  else if (eul.x() < calX)
+  {
+    eul.x() = eul.x() - calX;
+  }
+
+  if (eul.y() >= -1.59)
+  {
+    eul.y() = eul.y() - calY;
+  }
+
+  else if (eul.y() < 1.59)
+  {
+    eul.y() = eul.y() - calY;
+  }
+
+  if (eul.z() >= 0)
+  {
+    eul.z() = eul.z() - calZ;
+  }
+
+  else if (eul.z() < 0)
+  {
+    eul.z() = eul.z() - calZ;
+  }
+
+  IMUData1.eX = -eul.y();
+  IMUData1.eY = eul.z();
+  IMUData1.eZ = eul.x();
+
+  IMUData1.aH = -acc.z() * sin(eul.z()) + acc.x() * cos(eul.y()) * cos(eul.z()) + acc.y() * cos(eul.y()) * cos(eul.z());
+
+  /* Display the floating point data */
+  IMUData1.gX = gyr.z();
+  IMUData1.gY = gyr.x();
+  IMUData1.gZ = gyr.y();
+}
+
+void Barometer()
+{
+
+  if (BMPcalibrate == true)
+  {
+    // set the Calibration value
+    calheight = bmp.readAltitude(SEALEVELPRESSURE_HPA);
+    BMPcalibrate = false;
+  }
+
+  BMPtemp = bmp.temperature;
+  BMPheight = bmp.readAltitude(SEALEVELPRESSURE_HPA) - calheight;
+  pressure = bmp.pressure / 100.0;
+}
+
+float KalmanHeightA()
+{
+
+  if (isnan(BMPheight) || isnan(bufferedDist) || isnan(IMUData1.aH))
+  {
+    return bufferedDist / 100;
+  }
+
+  else
+  {
+
+    Ha_yk(0) = bufferedDist / 100;
+    Ha_uk(0) = IMUData1.aZ;
+    //MEASUREMENT UPDATE
+    //COMPUTE KALMAN GAIN
+    Ha_Kgain = Ha_Pk * (~Ha_C) * ((Ha_C * Ha_Pk * (~Ha_C) + Ha_R).Inverse());
+    //UPDATE ESTIMATE WITH VALUE
+    Ha_xk = Ha_xk + Ha_Kgain * (Ha_yk - Ha_C * Ha_xk);
+    //UPDATE ERROR COVARIANCE
+    Ha_Pk = (Ha_I - Ha_Kgain * Ha_C) * Ha_Pk;
+
+    //TIME UPDATE
+    //PROJECT THE STATE AHEAD
+    Ha_xk = Ha_A * Ha_xk + Ha_B * Ha_uk;
+    //PROJECT THE ERROR COVARIANCE AHEAD
+    Ha_Pk = Ha_A * Ha_Pk * (~Ha_A) + Ha_G * Ha_Q * (~Ha_G);
+
+    /*
+      Serial.print(H_zk(0)); //Baro
+      Serial.print(","); 
+      Serial.print(H_zk(1),5);//Lidar
+      Serial.print(",");
+      Serial.print(H_xk(0));//KalmanHeight
+      Serial.print(",");
+      Serial.print(H_xk(1));//KalmanVelocity
+      Serial.print(",");
+      Serial.println(H_xk(2));//KalmanBarometerOffsez
+      */
+    return Ha_xk(0);
+  }
+}
+
+float KalmanHeight()
+{
+
+  if (isnan(BMPheight) || isnan(bufferedDist) || isnan(IMUData1.aH))
+  {
+    return bufferedDist / 100;
+  }
+
+  else
+  {
+
+    H_zk(0) = BMPheight;
+    H_zk(1) = bufferedDist / 100;
+    H_uk(0) = IMUData1.aH;
+    //MEASUREMENT UPDATE
+    //COMPUTE KALMAN GAIN
+    H_Kgain = H_Pk * (~H_C) * ((H_C * H_Pk * (~H_C) + H_R).Inverse());
+    //UPDATE ESTIMATE WITH VALUE
+    H_xk = H_xk + H_Kgain * (H_zk - H_C * H_xk);
+    //UPDATE ERROR COVARIANCE
+    H_Pk = (H_I - H_Kgain * H_C) * H_Pk;
+
+    //TIME UPDATE
+    //PROJECT THE STATE AHEAD
+    H_xk = H_A * H_xk + H_B * H_uk;
+    //PROJECT THE ERROR COVARIANCE AHEAD
+    H_Pk = H_A * H_Pk * (~H_A) + H_Q;
+
+    /*
+      Serial.print(H_zk(0)); //Baro
+      Serial.print(","); 
+      Serial.print(H_zk(1),5);//Lidar
+      Serial.print(",");
+      Serial.print(H_xk(0));//KalmanHeight
+      Serial.print(",");
+      Serial.print(H_xk(1));//KalmanVelocity
+      Serial.print(",");
+      Serial.println(H_xk(2));//KalmanBarometerOffsez
+      */
+    return H_xk(0);
+  }
+}
+
+float KalmangyroX(float value)
+{
+  //MEASUREMENT UPDATE
+  //COMPUTE KALMAN GAIN
+  kGainX = uncertaintyEstX / (uncertaintyEstX + uncertaintyMeaX);
+  //UPDATE ESTIMATE WITH VALUE
+  currentEstX = lastEstX + kGainX * (value - lastEstX);
+  //UPDATE ERROR COVARIANCE
+  uncertaintyEstX = (1.0 - kGainX) * uncertaintyEstX;
+
+  //TIME UPDATE
+  //PROJECT THE ERROR COVARIANCE AHEAD
+  uncertaintyEstX = uncertaintyEstX + fabs(lastEstX - currentEstX) * processvarianceX;
+  //PROJECT THE STATE AHEAD
+  lastEstX = currentEstX;
+
+  return currentEstX;
+}
+
+float KalmangyroY(float value2)
+{
+  //MEASUREMENT UPDATE
+  //COMPUTE KALMAN GAIN
+  kGainY = uncertaintyEstY / (uncertaintyEstY + uncertaintyMeaY);
+  //UPDATE ESTIMATE WITH VALUE
+  currentEstY = lastEstY + kGainY * (value2 - lastEstY);
+  //UPDATE ERROR COVARIANCE
+  uncertaintyEstY = (1.0 - kGainY) * uncertaintyEstY;
+
+  //TIME UPDATE
+  //PROJECT THE ERROR COVARIANCE AHEAD
+  uncertaintyEstY = uncertaintyEstY + fabs(lastEstY - currentEstY) * processvarianceY;
+  //PROJECT THE STATE AHEAD
+  lastEstY = currentEstY;
+
+  return currentEstY;
+}
+
+float KalmangyroZ(float value3)
+{
+  //MEASUREMENT UPDATE
+  //COMPUTE KALMAN GAIN
+  kGainZ = uncertaintyEstZ / (uncertaintyEstZ + uncertaintyMeaZ);
+  //UPDATE ESTIMATE WITH VALUE
+  currentEstZ = lastEstZ + kGainZ * (value3 - lastEstZ);
+  //UPDATE ERROR COVARIANCE
+  uncertaintyEstZ = (1.0 - kGainZ) * uncertaintyEstZ;
+
+  //TIME UPDATE
+  //PROJECT THE ERROR COVARIANCE AHEAD
+  uncertaintyEstZ = uncertaintyEstZ + fabs(lastEstZ - currentEstZ) * processvarianceZ;
+  //PROJECT THE STATE AHEAD
+  lastEstZ = currentEstZ;
+
+  return currentEstZ;
+}
+
+float KalmanUltrasonic(float value4)
+{
+  //MEASUREMENT UPDATE
+  //COMPUTE KALMAN GAIN
+  kGainUS = uncertaintyEstUS / (uncertaintyEstUS + uncertaintyMeaUS);
+  //UPDATE ESTIMATE WITH VALUE
+  currentEstUS = lastEstUS + kGainUS * (value4 - lastEstUS);
+  //UPDATE ERROR COVARIANCE
+  uncertaintyEstUS = (1.0 - kGainUS) * uncertaintyEstUS;
+
+  //TIME UPDATE
+  //PROJECT THE ERROR COVARIANCE AHEAD
+  uncertaintyEstUS = uncertaintyEstUS + fabs(lastEstUS - currentEstUS) * processvarianceUS;
+  //PROJECT THE STATE AHEAD
+  lastEstUS = currentEstUS;
+
+  return currentEstUS;
+}
+
+void LQRController()
+{
+  //CALCULATE INTEGRAL for x(6)
+  //Update Time Interval
+  currentMillis = millis(); //100HZ Reading Rate
+  if (currentMillis - currentMillisIntegrator >= 10)
+  {
+    if (ESCon == true)
+    {
+      if (x(0) - xs(0) < 2 && x(0) - xs(0) > -0.5) //ANTI WINDUP
+        x(6) += (x(0) - xs(0)) * 0.01;
+        intval = x(6);
+    }
+
+    else
+    {
+      x(6) = 0;
+      intval = 0;
+    }
+    currentMillisIntegrator = currentMillis;
+  }
+
+  //UPDATE X MATRIX
+
+  //LOWPASS ULTRASONIC (Dreck)
+  //prevalueUS = (1.0-lowpassUS)*prevalueUS +lowpassUS*(bufferedDist)/1000;
+
+  x(0) = Ha_xk(0);
+  x(1) = Ha_xk(1);
+  x(2) = IMUData1.eX;
+  x(3) = IMUData1.eY;
+  x(4) = IMUData1.kgX;
+  x(5) = IMUData1.kgY;
+/*
+if(IMUData1.kgZ>60){
+  K(1,3) = 60 / 15;
+  K(2,2) = -60 / 15;
+}
+else if(IMUData1.kgZ<-60){
+  K(1,3) = -60 / 15;
+  K(2,2) = 60 / 15;
+
+}
+
+
+else{
+  K(1,3) = IMUData1.kgZ / 15;
+  K(2,2) = -IMUData1.kgZ / 15;
+}
+*/
+  if (x(2) > -0.01 && x(2) < 0.01)
+  {
+    x(2) = 0;
+  }
+
+  if (x(3) > -0.01 && x(3) < 0.01)
+  {
+    x(3) = 0;
+  }
+
+  //CALCULATE U
+
+  u = -K * (x - xs) + us;
+
+  //SET CAP
+  /*if(u(0)<10){
+    u(1) = 10;
+  }
+*/
+
+  //SET CAP 1 (no cap)
+  if ((u(1) / u(0)) > 1)
+  {
+    u(1) = 1 * u(0);
+  }
+
+  else if ((u(1) / u(0)) < -1)
+  {
+    u(1) = -1 * u(0);
+  }
+
+  if ((u(2) / u(0)) > 1)
+  {
+    u(2) = 1 * u(0);
+  }
+
+  else if ((u(2) / u(0)) < -1)
+  {
+    u(2) = -1 * u(0);
+  }
+
+  //CALCULATE INPUT IN DEGREES cuz rad trash
+  u(2) = -asin(u(2) / u(0)) /* * acos(asin(u(1) / u(0)))*/ * 57.2958;
+  u(1) = -asin(u(1) / u(0)) * 57.2958;
+}
+
+void ZControl(){
+
+valZ = eqZ - IMUData1.kgZ*57.2958*zgain;
+
+if (valZ<50){
+  valZ = 50;
+}
+if (valZ>130){
+  valZ = 130;
+}
+
+
+}
+
+void ServoControl()
+{
+  //FOR SERVO Y (Oben)
+  if (u(2) > 20)
+  {
+    valY = 150;
+  }
+  else if (u(2) < -20)
+  {
+    valY = 10;
+  }
+
+  else
+  {
+
+    if (u(2) < 0)
+    {
+
+      valY = 100 - abs(90 * (u(2) / 20));
+    }
+    else
+    {
+      valY = 100 + abs(50 * (u(2) / 20));
+    }
+  }
+  //U2 FOR SERVO X (Unten)
+  if (u(1) > 20)
+  {
+    valX = 170;
+  }
+
+  else if (u(1) < -20)
+  {
+    valX = 10;
+  }
+
+  else
+  {
+
+    if (u(1) < 0)
+    {
+
+      valX = 100 + (90 * (u(1) / 20));
+    }
+    else
+    {
+      valX = 100 + abs(70 * (u(1) / 20));
+    }
+  }
+  servoZ.write(valZ);
+  servoX.write(valX);
+  servoY.write(valY);
+}
+
+void ESCControl()
+{
+
+  //SET FUNCTION FOR THRUST CURVE
+    ESCvalue = ((1000 * (u(0) / 9.81) - ESCdefault) / 9) * (batteryref / (10));
+  //ESCvalue = ((1000 * (u(0) / 9.81) - ESCdefault) / 9) * (batteryref / (batteryvolt-2));
+  if (ESCvalue<100){
+    ESCvalue = 100;
+  }
+
+  if (ESCvalue > 180){
+    ESCvalue = 180;
+  }
+
+  ESC.write(ESCvalue);
+}
+
+void Startup()
+{
+currentMillis = millis();
+if (currentMillis - StartupMillis >= 1000)
+  {
+
+  ESCstartup = false;
+
+}
+
+else {
+ESC.write(80);
+}
+
+
+
+}
+/*
+void ESCStartupCal()
+{
+  
+  currentMillis = millis();
+  if (currentMillis - StartupMillis >= 4000)
+  {
+
+    if (currentMillis - StartupMillis >= 4500)
+    {
+
+      if (onground == false || bufferedDist > 30)
+      {
+        ESCdefault = ESCdefault + 20;
+        ESCstartup = false;
+      }
+      else if (currentMillis - StartupRiseMillis >= 50)
+      {
+        ESCdefault = ESCdefault - 1;
+        StartupRiseMillis = currentMillis;
+      }
+    }
+    //SET FUNCTION FOR THRUST CURVE
+    ESCvalue = ((1000 * (us(0) / 9.81) - ESCdefault) / 9) * (batteryref / (batteryvolt - 2));
+  }
+  ESC.write(ESCvalue);
+}
+*/
+
+void Land()
+{
+  K(0,6) = 0.41;
+  xs(0) = 0;
+  ESCvalue = (((1000 * (u(0) / 9.81) - ESCdefault) / 9) * (batteryref / (10))-10);
+  //ESCvalue = (((1000 * (u(0) / 9.81) - ESCdefault) / 9) * (batteryref / (batteryvolt - 2)));
+
+  if (ESCvalue < 100)
+  {
+    ESCvalue = 100;
+  }
+
+
+    if (ESCvalue > 160){
+    ESCvalue = 160;
+  }
+
+  if (bufferedDist < 40 && closeGround == false)
+  {
+    //SET FUNCTION FOR THRUST CURVE
+    ESCvalue = ESCvalue + 5;
+  }
+
+
+  if (bufferedDist < 20 && closeGround == false)
+  {
+    //SET FUNCTION FOR THRUST CURVE
+    ESCvalue = ESCvalue + 2;
+  }
+
+if ((onground == true && bufferedDist <= 1)){
+  kLand=300;
+
+}
+
+  if ((onground == true && bufferedDist < 2 && kLand < 300) || (closeGround == true && kLand < 300))
+  {
+    closeGround = true;
+    //SET FUNCTION FOR THRUST CURVE
+    ESCvalue = ESCvalue - 5;
+    kLand++;
+  }
+  
+
+  if ((onground == true && bufferedDist < 1 && kLand >= 300) || (closeGround == true && kLand >= 300))
+  {
+    closeGround = false;
+    ESCvalue = 0;
+    kLand = 0;
+    ESCon = false;
+    ESCland = false;
+    xs(0) = 0.75;
+  }
+
+  ESC.write(ESCvalue);
+}
+
+void loop()
+{
+
+  //GET ULTRASONIC SENSOR DATA
+  currentMillis = millis(); //250HZ Reading Rate
+  if (currentMillis - USMillis >= 4)
+  {
+
+    Ultrasonic();
+    unfilteredDist = bufferedDist;
+    //bufferedDist = KalmanUltrasonic(bufferedDist);
+
+    USMillis = currentMillis;
+  }
+
+  //GET IMU SENSOR DATA
+
+  currentMillis = millis(); //100HZ Reading Rate
+  if (currentMillis - IMUMillis >= 10)
+  {
+    IMU();
+    IMUData1.kgX = KalmangyroX(IMUData1.gX) * 0.0174533;
+    IMUData1.kgY = KalmangyroY(IMUData1.gY) * 0.0174533;
+    IMUData1.kgZ = KalmangyroZ(IMUData1.gZ) * 0.0174533;
+    IMUMillis = currentMillis;
+    KalmanHeight();
+    KalmanHeightA();
+  }
+
+  //GET BAROMETER SENSOR DATA & READ EDF Volt
+
+  currentMillis = millis(); //10HZ Reading Rate
+  if (currentMillis - BMPMillis >= 100)
+  {
+    Barometer();
+    edfbattVal1 = analogRead(edfVolt1); //EDF Voltage Measurement
+    BMPMillis = currentMillis;
+  }
+
+  //QUICK MAFS
+  LQRController();
+  ZControl();
+  //WRITE TO THE SD CARD
+  if (SDwriteState == true)
+  {
+
+    /*
+    if (SDreconnect == true)
+    { //Mashallah
+      SDreconnect = false;
+      if (!SD.begin(chipSelect))
+      {
+        Serial.println("initialization failed!");
+        SDwriteState = false;
+        SDreconnect = true;
+      }
+      Serial.println("SD CARD RECONNECTED"); //Print data on Serial Monitor
+      LEDstate1 = {256, 256, 256, false};    //an
+
+      LEDchange = true;
+      dataFile = SD.open(fileName, FILE_WRITE);
+    }
+    */
+    currentMillis = millis(); //100HZ WRITING RATE
+    if (currentMillis - SDMillis >= 10)
+    {
+      SDstore();
+      //WENN SD KARTE MEHR ALS 100ms laggt direkt Dreck weg mit SD Karte suscht isch gsi
+      if (millis() - currentMillis > 100)
+      {
+        SDwriteState = false;
+
+        LEDstate1 = {brightness, 256, brightness, false}; //an
+        Serial.println("SD CARD DISCONNECTED");           //Print data on Serial Monitor
+        LEDchange = true;
+      }
+
+      SDMillis = currentMillis;
+    }
+  }
+
+  //ONLY TURN SERVOS FOR THRUST VECTORING ON IF USER
+  if (ServoOn == true)
+  {
+
+    ServoControl();
+  }
+
+  //ONLY TURN FAN ON IF THE USER ALLOWS IT
+  if (ESCon == true)
+  {
+
+    if (ESCland == false)
+    {
+      if (ESCstartup == true)
+      {
+        Startup();
+      }
+      else
+      {
+        
+      ESCControl();
+      }
+    }
+    if (ESCland == true || AppActive == false || Connected == false)
+    {
+      Land();
+    }
+  }
+
+  //IF SOMEHOW RIP PHONE OR RIP APP, TURN FAN OFF
+  if (ESCon == false)
+  {
+    closeGround = false;
+    ESCon = false;
+    ESCland = false;
+    //ESCstartup = false;
+    ESCvalue = 0;
+    ESC.write(ESCvalue);
+  }
+
+  //PRINT DATA TO SERIAL MONITOR
+  DataOutput();
+
+  //READ COMMANDS FROM THE APP -> WEMOS WIFI BOARD
+  CommandRead();
+  //COOL RGB LIGHT GAMING +10000FPS RTX 3090
+  LEDfunction(LEDstate1);
+
+  delay(1000 / samplerate);
+}
