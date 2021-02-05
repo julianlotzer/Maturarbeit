@@ -659,7 +659,7 @@ void CommandRead()
     {
 
       DataWemos.remove(0, 1);
-      xs(0) = (DataWemos.toInt() - 100) / 100;
+      xs(0) = (DataWemos.toFloat() - 100) / 100;
     }
 
     //LEDS
